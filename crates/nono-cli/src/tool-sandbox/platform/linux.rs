@@ -132,6 +132,8 @@ struct ToolSandboxState {
     proxy_trust_bundle_paths: Vec<PathBuf>,
     scoped_proxy_env_vars: BTreeMap<String, Vec<(String, String)>>,
     reserved_proxy_ports: BTreeSet<u16>,
+    /// User and network namespaces of an isolated session, joined by eligible commands.
+    session_netns: std::sync::OnceLock<(OwnedFd, OwnedFd)>,
     active_children: Mutex<HashMap<u32, ActiveChild>>,
     /// Attributes severed-ancestry callers to their spawning command. See `lineage_cgroup`.
     lineage: LineageMarker,
@@ -417,6 +419,7 @@ impl PreparedToolSandboxRuntime {
                 proxy_trust_bundle_paths: proxy_trust_bundle_paths.to_vec(),
                 scoped_proxy_env_vars: scoped_proxy_env_vars.clone(),
                 reserved_proxy_ports: reserved_proxy_ports.clone(),
+                session_netns: std::sync::OnceLock::new(),
                 active_children: Mutex::new(HashMap::new()),
                 lineage,
                 active_count: AtomicUsize::new(0),
@@ -452,6 +455,14 @@ impl PreparedToolSandboxRuntime {
 
     pub(crate) fn env_overrides(&self) -> Vec<(String, String)> {
         vec![("PATH".to_string(), self.inner.session_path.clone())]
+    }
+
+    pub(crate) fn set_session_netns(&self, user: OwnedFd, net: OwnedFd) -> Result<()> {
+        self.inner.session_netns.set((user, net)).map_err(|_| {
+            NonoError::SandboxInit(
+                "command-mediation session network namespace is already set".to_string(),
+            )
+        })
     }
 
     pub(crate) fn broker_secret_env_vars(
@@ -924,8 +935,24 @@ fn run_child_launcher() -> Result<()> {
     let start_caps_from = std::time::Instant::now();
     let caps = caps_from_spec(&spec.caps)?;
     tool_sandbox_profile_log!("launcher:caps_from_spec: {:?}", start_caps_from.elapsed());
+    // Mediated UDP is safe only where loopback is the sole interface.
+    if spec.session_netns
+        && fs::read_to_string("/proc/self/net/dev")
+            .map_err(NonoError::Io)?
+            .lines()
+            .skip(2)
+            .any(|line| line.split(':').next().map(str::trim) != Some("lo"))
+    {
+        return Err(NonoError::SandboxInit(
+            "command sandbox UDP requires the session's loopback-only network namespace"
+                .to_string(),
+        ));
+    }
     let start_sandbox_apply = std::time::Instant::now();
-    Sandbox::apply_seccomp(&caps, nono::SeccompOpts::network_baseline())?;
+    Sandbox::apply_seccomp(
+        &caps,
+        nono::SeccompOpts::network_baseline().with_mediated_udp(spec.session_netns),
+    )?;
     tool_sandbox_profile_log!(
         "launcher:sandbox_apply: {:?}",
         start_sandbox_apply.elapsed()
@@ -3730,6 +3757,7 @@ fn build_child_launch_spec_for_binary(
         stdio_mode: selected_stdio_mode(request).to_string(),
         stdio_limits: stdio_limits_from_policy(policy),
         caps: caps_to_spec(&caps),
+        session_netns: state.session_netns.get().is_some() && joins_session_netns(&caps),
         allowed_exec_paths,
         expected_dev: binary.dev,
         expected_ino: binary.ino,
@@ -4584,6 +4612,44 @@ fn install_lineage_attach(
     Ok(())
 }
 
+/// Proxy-routed commands join the session netns; direct TCP grants need the host network.
+fn joins_session_netns(caps: &CapabilitySet) -> bool {
+    matches!(caps.network_mode(), NetworkMode::ProxyOnly { .. })
+        && caps.tcp_connect_ports().is_empty()
+        && caps.tcp_bind_ports().is_empty()
+}
+
+fn install_session_netns_join(
+    state: &ToolSandboxState,
+    join: bool,
+    command: &mut Command,
+) -> Result<()> {
+    if !join {
+        return Ok(());
+    }
+    let (user, net) = state
+        .session_netns
+        .get()
+        .map(|(user, net)| (user.as_raw_fd(), net.as_raw_fd()))
+        .ok_or_else(|| {
+            NonoError::SandboxInit(
+                "command-mediation session network namespace is unavailable".to_string(),
+            )
+        })?;
+    // SAFETY: setns is async-signal-safe; an error fails the spawn, so the command never runs outside the namespace.
+    unsafe {
+        command.pre_exec(move || {
+            for (fd, kind) in [(user, libc::CLONE_NEWUSER), (net, libc::CLONE_NEWNET)] {
+                if libc::setns(fd, kind) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
 fn launch_child(
     state: &ToolSandboxState,
     command_name: &str,
@@ -4597,7 +4663,9 @@ fn launch_child(
     tool_sandbox_profile_log!("launch_child:write_spec: {:?}", start_write.elapsed());
     let start_spawn_wait = std::time::Instant::now();
     let result = match spec.stdio_mode.as_str() {
-        "pty" => launch_child_with_pty(state, command_name, launch_caller, &spec_path, stdio),
+        "pty" => {
+            launch_child_with_pty(state, command_name, launch_caller, &spec_path, &spec, stdio)
+        }
         "direct_fds" => launch_child_with_direct_fds(
             state,
             command_name,
@@ -4643,6 +4711,7 @@ fn launch_child_with_direct_fds(
         .stdout(Stdio::from(File::from(stdio.stdout)))
         .stderr(Stdio::from(File::from(stdio.stderr)));
     install_lineage_attach(state, command_name, &mut command)?;
+    install_session_netns_join(state, spec.session_netns, &mut command)?;
     let mut child =
         crate::owned_children::spawn(&mut command).map_err(NonoError::CommandExecution)?;
     drop(command);
@@ -4679,6 +4748,7 @@ fn launch_child_with_brokered_stdio(
         .stdout(Stdio::from(File::from(stdout_write)))
         .stderr(Stdio::from(File::from(stderr_write)));
     install_lineage_attach(state, command_name, &mut command)?;
+    install_session_netns_join(state, spec.session_netns, &mut command)?;
 
     let mut child =
         crate::owned_children::spawn(&mut command).map_err(NonoError::CommandExecution)?;
@@ -4943,6 +5013,7 @@ fn launch_child_with_capture(
     // stdio.stdout is not used for capture; drop it so the fd is closed.
     drop(stdio.stdout);
     install_lineage_attach(state, command_name, &mut command)?;
+    install_session_netns_join(state, spec.session_netns, &mut command)?;
 
     let mut child =
         crate::owned_children::spawn(&mut command).map_err(NonoError::CommandExecution)?;
@@ -4984,6 +5055,7 @@ fn launch_child_with_pty(
     command_name: &str,
     launch_caller: &Caller,
     spec_path: &Path,
+    spec: &ToolSandboxChildLaunchSpec,
     stdio: StdioFds,
 ) -> Result<ChildLaunchResult> {
     let pty = crate::pty_proxy::open_pty()?;
@@ -5002,6 +5074,7 @@ fn launch_child_with_pty(
         .stdout(Stdio::from(File::from(stdout_slave)))
         .stderr(Stdio::from(File::from(stderr_slave)));
     install_lineage_attach(state, command_name, &mut command)?;
+    install_session_netns_join(state, spec.session_netns, &mut command)?;
     let mut child =
         crate::owned_children::spawn(&mut command).map_err(NonoError::CommandExecution)?;
     drop(command);
@@ -6605,6 +6678,7 @@ mod tests {
             proxy_trust_bundle_paths: Vec::new(),
             scoped_proxy_env_vars: BTreeMap::new(),
             reserved_proxy_ports: BTreeSet::new(),
+            session_netns: std::sync::OnceLock::new(),
             active_children: Mutex::new(HashMap::new()),
             lineage: LineageMarker::disabled_for_test(),
             active_count: AtomicUsize::new(0),
@@ -6785,6 +6859,90 @@ mod tests {
                 id: FileId { dev: 1, ino: 1 },
             },
         )
+    }
+
+    #[test]
+    fn only_proxy_routed_commands_join_the_session_namespace() -> Result<()> {
+        let proxied = CapabilitySet::new().set_network_mode(NetworkMode::ProxyOnly {
+            port: 3128,
+            bind_ports: Vec::new(),
+        });
+        assert!(joins_session_netns(&proxied));
+        let mut local = proxied.clone();
+        local.add_localhost_port_range(40_000, 40_100)?;
+        assert!(joins_session_netns(&local));
+        assert!(!joins_session_netns(&CapabilitySet::new().block_network()));
+        let mut direct = proxied.clone();
+        direct.add_tcp_connect_port(5432);
+        assert!(!joins_session_netns(&direct));
+        let mut inbound = proxied;
+        inbound.add_tcp_bind_port(8080);
+        assert!(!joins_session_netns(&inbound));
+        assert!(!joins_session_netns(&CapabilitySet::new()));
+        Ok(())
+    }
+
+    #[test]
+    fn session_netns_join_fails_closed_without_a_namespace() {
+        let state =
+            test_state_for_membership(PathBuf::from("/tmp/nono-tool-sandbox-test/supervisor.sock"));
+        let mut command = Command::new("/bin/true");
+        assert!(install_session_netns_join(&state, false, &mut command).is_ok());
+        assert!(install_session_netns_join(&state, true, &mut command).is_err());
+    }
+
+    #[test]
+    fn session_netns_join_runs_the_command_in_that_namespace() -> Result<()> {
+        let spec = nono::NamespaceSpec::new().network(true);
+        if nono::Sandbox::probe_namespaces(&spec)? != nono::NamespaceProbe::Available {
+            eprintln!("skipping: unprivileged network namespaces unavailable");
+            return Ok(());
+        }
+        let mut holder = Command::new("/bin/sleep");
+        holder.arg("30");
+        // SAFETY: unshare is async-signal-safe and touches only the forked child.
+        unsafe {
+            holder.pre_exec(|| {
+                if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        let mut holder = holder.spawn().map_err(NonoError::CommandExecution)?;
+        let pid = holder.id();
+        let ns = |name: &str| format!("/proc/{pid}/ns/{name}");
+        let joined = (|| -> Result<(PathBuf, Vec<u8>)> {
+            nono::sandbox::write_id_maps(pid as libc::pid_t)?;
+            let open = |name: &str| {
+                File::open(ns(name))
+                    .map(OwnedFd::from)
+                    .map_err(NonoError::Io)
+            };
+            let state = test_state_for_membership(PathBuf::from(
+                "/tmp/nono-tool-sandbox-test/supervisor.sock",
+            ));
+            let netns = (open("user")?, open("net")?);
+            assert!(state.session_netns.set(netns).is_ok());
+            let mut command = Command::new("/bin/readlink");
+            command.arg("/proc/self/ns/net");
+            install_session_netns_join(&state, true, &mut command)?;
+            let output = command.output().map_err(NonoError::CommandExecution)?;
+            assert!(output.status.success(), "{output:?}");
+            Ok((
+                fs::read_link(ns("net")).map_err(NonoError::Io)?,
+                output.stdout,
+            ))
+        })();
+        let _ = holder.kill();
+        let _ = holder.wait();
+        let (expected, stdout) = joined?;
+        assert_eq!(
+            String::from_utf8_lossy(&stdout).trim(),
+            expected.to_string_lossy()
+        );
+        Ok(())
     }
 
     // Peer pid 1 with an unrelated root: the walk ends before the root (as after a

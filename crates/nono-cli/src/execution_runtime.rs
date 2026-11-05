@@ -797,6 +797,8 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         sandbox_policy: flags.sandbox_policy,
         #[cfg(target_os = "linux")]
         namespaces,
+        #[cfg(target_os = "linux")]
+        scoped_proxy_handles: &scoped_proxy_handles,
         allowed_env_vars: flags.allowed_env_vars,
         denied_env_vars: flags.denied_env_vars,
         case_insensitive_env_vars: flags.case_insensitive_env_vars,

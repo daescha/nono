@@ -30,8 +30,8 @@ pub use linux::{
 // Re-export Linux opt-in namespace isolation mechanism (NEP-0004)
 #[cfg(target_os = "linux")]
 pub use linux_namespace::{
-    NamespaceProbe, NamespaceProbeStage, NamespaceSpec, probe_namespaces, validate_bridge_listener,
-    write_id_maps,
+    NamespaceProbe, NamespaceProbeStage, NamespaceSpec, bridge_listener_raw, probe_namespaces,
+    validate_bridge_listener, write_id_maps,
 };
 
 // Re-export Linux WSL2 detection
