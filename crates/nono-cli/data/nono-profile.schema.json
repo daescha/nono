@@ -2347,6 +2347,10 @@
           "type": "array",
           "items": { "type": "integer", "minimum": 0, "maximum": 65535 },
           "description": "Raw TCP bind ports. Requires Landlock ABI v4+ TCP support."
+        },
+        "ephemeral_bind": {
+          "type": "boolean",
+          "description": "Let the command bind kernel-chosen (port 0) TCP ports, e.g. for JVM tools that start loopback listeners. Linux only; requires linux.isolate.network."
         }
       }
     },

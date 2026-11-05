@@ -1143,11 +1143,15 @@ pub struct CommandNetworkConfig {
     /// Localhost port ranges this command may bind, as `[start, end]` pairs.
     #[serde(default)]
     pub open_port_range: Vec<[u16; 2]>,
+    /// Let the command bind kernel-chosen ports. Linux only; requires `linux.isolate.network`.
+    #[serde(default)]
+    pub ephemeral_bind: bool,
 }
 
 impl CommandNetworkConfig {
     fn merge_child(&self, child: &Self) -> Self {
         Self {
+            ephemeral_bind: self.ephemeral_bind || child.ephemeral_bind,
             allow_all: self.allow_all || child.allow_all,
             allow_domain: dedup_append(&self.allow_domain, &child.allow_domain),
             tcp_connect_ports: dedup_append(&self.tcp_connect_ports, &child.tcp_connect_ports),

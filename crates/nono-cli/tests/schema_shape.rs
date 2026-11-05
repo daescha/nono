@@ -721,6 +721,7 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
         &[
             "allow_all",
             "allow_domain",
+            "ephemeral_bind",
             "tcp_bind_ports",
             "tcp_connect_ports",
         ],

@@ -3736,6 +3736,15 @@ fn build_child_launch_spec_for_binary(
         allowed_exec_paths.push(path.as_os_str().as_bytes().to_vec());
     }
 
+    let session_netns = state.session_netns.get().is_some() && joins_session_netns(&caps);
+    if !session_netns
+        && matches!(caps.network_mode(), NetworkMode::ProxyOnly { bind_ports, .. } if bind_ports.contains(&0))
+    {
+        return Err(NonoError::SandboxInit(format!(
+            "command '{}': ephemeral_bind requires the session's isolated network namespace",
+            request.command
+        )));
+    }
     Ok(ToolSandboxChildLaunchSpec {
         real_binary: binary.canonical_path.as_os_str().as_bytes().to_vec(),
         executable_kind: format!("{:?}", binary.shape.kind),
@@ -3757,7 +3766,7 @@ fn build_child_launch_spec_for_binary(
         stdio_mode: selected_stdio_mode(request).to_string(),
         stdio_limits: stdio_limits_from_policy(policy),
         caps: caps_to_spec(&caps),
-        session_netns: state.session_netns.get().is_some() && joins_session_netns(&caps),
+        session_netns,
         allowed_exec_paths,
         expected_dev: binary.dev,
         expected_ino: binary.ino,
@@ -4269,9 +4278,14 @@ fn add_policy_proxy_network(
                 .to_string(),
         )
     })?;
+    // A port 0 bind rule grants ephemeral binds; the launch spec allows it only inside the session netns.
+    let ephemeral = policy
+        .network
+        .as_ref()
+        .is_some_and(|network| network.ephemeral_bind);
     caps.set_network_mode_mut(NetworkMode::ProxyOnly {
         port,
-        bind_ports: Vec::new(),
+        bind_ports: if ephemeral { vec![0] } else { Vec::new() },
     });
     Ok(())
 }

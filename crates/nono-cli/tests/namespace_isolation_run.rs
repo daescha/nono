@@ -242,6 +242,51 @@ fn isolated_command_sandbox_gets_namespace_confined_udp() {
 }
 
 #[test]
+fn command_sandbox_binds_ephemeral_ports_only_in_the_isolated_netns() {
+    let Some(py) = python3_bin() else {
+        eprintln!("skipping: no system python3 available");
+        return;
+    };
+    let probe = "import socket\ns = socket.socket()\ns.bind(('127.0.0.1', 0))\nprint('BOUND', s.getsockname()[1] > 0)";
+    for (isolate, isolated) in [
+        (r#""linux":{"isolate":{"network":true}},"#, true),
+        ("", false),
+    ] {
+        let t = nono_test!("iso-ephemeral");
+        let profile = t.write_profile(
+            "iso-ephemeral",
+            &format!(
+                r#"{{"meta":{{"name":"iso-ephemeral"}},"workdir":{{"access":"read"}},
+                "network":{{"allow_domain":["example.com"]}},{isolate}
+                "command_policies":{{"commands":{{"python3":{{"executable":"{py}",
+                "sandbox":{{"fs_read":["/usr"],"network":{{"allow_domain":["example.org"],"ephemeral_bind":true}}}}}}}}}}}}"#
+            ),
+        );
+        let completed = t
+            .run()
+            .profile(&profile)
+            .allow_cwd()
+            .no_rollback()
+            .exec(Argv::new("python3").arg("-c").arg(probe));
+        if host_unsupported(&completed) {
+            return;
+        }
+        if isolated {
+            let completed = completed.assert_success("ephemeral bind inside the netns");
+            assert!(
+                completed.stdout().contains("BOUND True"),
+                "{}",
+                completed.stdout()
+            );
+        } else {
+            completed
+                .assert_failure("ephemeral bind outside the netns is refused")
+                .assert_stderr_contains("ephemeral_bind requires linux.isolate.network");
+        }
+    }
+}
+
+#[test]
 fn isolated_network_rejects_unrestricted_network() {
     let t = nono_test!("iso-allow-all");
     let profile = t.write_profile(
