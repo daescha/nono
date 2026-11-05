@@ -2427,6 +2427,10 @@
             "maxItems": 2
           },
           "description": "Inclusive localhost port ranges this command may bind and connect to, as [start, end] pairs."
+        },
+        "ephemeral_bind": {
+          "type": "boolean",
+          "description": "Let the command bind kernel-chosen (port 0) TCP ports, e.g. for JVM tools that start loopback listeners. Linux only; requires linux.isolate.network."
         }
       }
     },

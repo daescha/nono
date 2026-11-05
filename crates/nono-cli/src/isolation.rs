@@ -83,7 +83,7 @@ pub(crate) fn validate_config(args: &SandboxArgs, prepared: &PreparedSandbox) ->
         ));
     }
     if !isolate.network {
-        return Ok(());
+        return reject_ephemeral_bind_without_network(prepared);
     }
     let blocked = args.block_net || prepared.profile_network_block;
     if !blocked && !has_proxy_intent(args, prepared) {
@@ -144,6 +144,28 @@ fn reject_command_network_grants(
          isolated namespace where host localhost ports are unreachable: {callbacks}. Remove \
          these grants, add linux.isolate.loopback, or do not use network isolation."
     )))
+}
+
+/// An ephemeral bind outside the isolated namespace would open a listener on the host network.
+fn reject_ephemeral_bind_without_network(prepared: &PreparedSandbox) -> Result<()> {
+    let Some(policies) = &prepared.command_policies else {
+        return Ok(());
+    };
+    for (name, command) in &policies.commands {
+        let sandboxes = command
+            .sandbox
+            .iter()
+            .chain(command.from.values().filter_map(|from| from.sandbox()));
+        for sandbox in sandboxes {
+            if sandbox.network.as_ref().is_some_and(|n| n.ephemeral_bind) {
+                return Err(NonoError::ConfigParse(format!(
+                    "command_policies.commands.{name}: network.ephemeral_bind requires \
+                     linux.isolate.network"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `loopback` lifts TCP enforcement on the grounds that the network namespace

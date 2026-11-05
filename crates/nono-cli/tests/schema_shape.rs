@@ -756,6 +756,7 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
         &[
             "allow_all",
             "allow_domain",
+            "ephemeral_bind",
             "open_port",
             "open_port_range",
             "tcp_bind_ports",
