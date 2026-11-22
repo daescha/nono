@@ -1112,6 +1112,50 @@ fn explicit_network_backends_with_af_unix() -> Result<()> {
 }
 
 #[test]
+fn proxy_mode_creates_udp_sockets_only_in_a_network_namespace() -> Result<()> {
+    isolated(
+        "proxy_mode_creates_udp_sockets_only_in_a_network_namespace",
+        || {
+            let _lock = lock_listener_ownership()?;
+            let caps = capabilities(34567, 34568)?;
+            let script = concat!(
+                "import fcntl, socket, struct, sys\n",
+                "try: s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
+                "except OSError as e: sys.exit(e.errno)\n",
+                "fcntl.ioctl(s.fileno(), 0x8913, struct.pack('16sH22x', b'lo', 0))\n",
+                "try: s.sendto(b'x', ('192.0.2.1', 9))\n",
+                "except OSError as e: sys.exit(100 + e.errno)\n",
+            );
+            let netns = nono::NamespaceSpec::new().network(true);
+            let netns_available =
+                nono::Sandbox::probe_namespaces(&netns)? == nono::NamespaceProbe::Available;
+            for (namespaces, exit) in [(None, libc::EPERM), (Some(netns), 100 + libc::EACCES)] {
+                if namespaces.is_some() && !netns_available {
+                    eprintln!("skipping namespace case: unprivileged namespaces unavailable");
+                    continue;
+                }
+                let mut config = config(&caps, false, true);
+                config.namespaces = namespaces;
+                let bootstrap = run(
+                    &config,
+                    script,
+                    landlock::ABI::V4,
+                    Fault::None,
+                    None,
+                    None,
+                    None,
+                )?;
+                assert_eq!(
+                    supervise(&bootstrap, &caps, config.seccomp_policy, 34567, 34568)?,
+                    exit
+                );
+            }
+            Ok(())
+        },
+    )
+}
+
+#[test]
 #[ignore = "requires live cgroup v2 memory delegation; run with --ignored"]
 fn live_cgroup_with_combined_notifications() -> Result<()> {
     isolated("live_cgroup_with_combined_notifications", || {

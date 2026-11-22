@@ -457,7 +457,19 @@ impl PreparedToolSandboxRuntime {
         vec![("PATH".to_string(), self.inner.session_path.clone())]
     }
 
-    pub(crate) fn set_session_netns(&self, user: OwnedFd, net: OwnedFd) -> Result<()> {
+    pub(crate) fn set_session_netns(&self, pid: i32, user: OwnedFd, net: OwnedFd) -> Result<()> {
+        // Mediated UDP is safe only where loopback is the sole interface.
+        if fs::read_to_string(format!("/proc/{pid}/net/dev"))
+            .map_err(NonoError::Io)?
+            .lines()
+            .skip(2)
+            .any(|line| line.split(':').next().map(str::trim) != Some("lo"))
+        {
+            return Err(NonoError::SandboxInit(
+                "command sandbox UDP requires the session's loopback-only network namespace"
+                    .to_string(),
+            ));
+        }
         self.inner.session_netns.set((user, net)).map_err(|_| {
             NonoError::SandboxInit(
                 "command-mediation session network namespace is already set".to_string(),
@@ -890,8 +902,11 @@ fn prepare_launcher_command(
     let binary_fd = open_and_verify_binary(binary, spec)?;
     let caps = caps_from_spec(&spec.caps)?;
     let abi = Sandbox::detect_abi()?;
-    let sandbox =
-        Sandbox::prepare_seccomp_with_abi(&caps, &abi, nono::SeccompOpts::network_baseline())?;
+    let sandbox = Sandbox::prepare_seccomp_with_abi(
+        &caps,
+        &abi,
+        nono::SeccompOpts::network_baseline().with_mediated_udp(spec.session_netns),
+    )?;
     let exec_paths: Vec<PathBuf> = spec
         .allowed_exec_paths
         .iter()

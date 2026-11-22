@@ -1548,7 +1548,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     .and_then(|()| {
                         match (bootstrap.session_netns.take(), config.tool_sandbox_runtime) {
                             (Some((user, net)), Some(runtime)) => {
-                                runtime.set_session_netns(user, net)
+                                runtime.set_session_netns(child.as_raw(), user, net)
                             }
                             _ => Ok(()),
                         }
